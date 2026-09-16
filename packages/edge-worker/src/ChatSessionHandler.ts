@@ -121,6 +121,10 @@ export interface ChatSessionHandlerDeps {
 	getOpenCodeGlobalStateScope?: () =>
 		| OpenCodeConfigOverrides["stateScope"]
 		| undefined;
+	/** Read live global OpenCode external directories at session-build time */
+	getOpenCodeGlobalAllowedDirectories?: () =>
+		| OpenCodeConfigOverrides["allowedDirectories"]
+		| undefined;
 	onWebhookStart: () => void;
 	onWebhookEnd: () => void;
 	onStateChange: () => Promise<void>;
@@ -795,6 +799,8 @@ export class ChatSessionHandler<TEvent> {
 			skills: skillsConfig.skills,
 			opencodeGlobalConfig: this.deps.getOpenCodeGlobalConfig?.(),
 			opencodeGlobalStateScope: this.deps.getOpenCodeGlobalStateScope?.(),
+			opencodeGlobalAllowedDirectories:
+				this.deps.getOpenCodeGlobalAllowedDirectories?.(),
 			logger: sessionLogger,
 			onMessage: (message: SDKMessage) =>
 				this.handleAgentMessage(sessionId, message),

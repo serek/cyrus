@@ -36,6 +36,36 @@ export interface OpenCodeSessionInfo extends AgentSessionInfo {
 	sessionId: string | null;
 }
 
+/** The observed lifecycle state of one OpenCode child-process runner. */
+export type RunnerHealthState = "idle" | "running" | "exited";
+
+/** The most recent process-level observation recorded for a runner. */
+export type RunnerHealthEvent =
+	| "spawn"
+	| "stdout"
+	| "stderr"
+	| "stream_event"
+	| "queue"
+	| "error"
+	| "exit";
+
+/**
+ * A small, immutable-at-the-boundary view of an OpenCode runner's process
+ * health. `lastEventAt` is an epoch timestamp so callers can assess event
+ * freshness without sharing a mutable Date instance.
+ */
+export interface RunnerHealthSnapshot {
+	state: RunnerHealthState;
+	pid: number | null;
+	sessionId: string | null;
+	turn: number;
+	lastEvent: RunnerHealthEvent | null;
+	lastEventAt: number | null;
+	exitCode: number | null;
+	exitSignal: NodeJS.Signals | null;
+	queuedFollowUpCount: number;
+}
+
 export interface OpenCodeRunnerEvents {
 	message: (message: SDKMessage) => void;
 	error: (error: Error) => void;

@@ -116,6 +116,8 @@ export interface ChatRunnerConfigInput {
 	opencodeGlobalConfig?: OpenCodeConfigOverrides["config"];
 	/** Global OpenCode CLI state scope from Cyrus config */
 	opencodeGlobalStateScope?: OpenCodeConfigOverrides["stateScope"];
+	/** Global OpenCode external directories from Cyrus config */
+	opencodeGlobalAllowedDirectories?: OpenCodeConfigOverrides["allowedDirectories"];
 	/** Existing runner type to preserve when resuming a completed chat session */
 	runnerType?: RunnerType;
 	logger: ILogger;
@@ -169,6 +171,8 @@ export interface IssueRunnerConfigInput {
 	opencodeGlobalConfig?: OpenCodeConfigOverrides["config"];
 	/** Global OpenCode CLI state scope from Cyrus config */
 	opencodeGlobalStateScope?: OpenCodeConfigOverrides["stateScope"];
+	/** Global OpenCode external directories from Cyrus config */
+	opencodeGlobalAllowedDirectories?: OpenCodeConfigOverrides["allowedDirectories"];
 	/**
 	 * Allow-list of skill names enabled for the session (after scope filtering),
 	 * or `"all"` to enable every discovered skill, or `undefined` to defer to
@@ -481,7 +485,14 @@ export class RunnerConfigBuilder {
 			workingDirectory: cwd,
 			allowedTools: input.allowedTools,
 			disallowedTools: input.disallowedTools,
-			allowedDirectories: input.allowedDirectories,
+			allowedDirectories:
+				runnerType === "opencode"
+					? [
+							...input.allowedDirectories,
+							...(input.opencodeGlobalAllowedDirectories ?? []),
+							...(input.repository.opencode?.allowedDirectories ?? []),
+						].filter((path, index, paths) => paths.indexOf(path) === index)
+					: input.allowedDirectories,
 			...(additionalDirectories.length > 0 && { additionalDirectories }),
 			workspaceName: input.session.issue?.identifier || input.session.issueId,
 			cyrusHome: input.cyrusHome,
@@ -527,6 +538,8 @@ export class RunnerConfigBuilder {
 				}),
 			...(runnerType === "opencode" && {
 				opencodeGlobalConfig: input.opencodeGlobalConfig,
+				opencodeGlobalAllowedDirectories:
+					input.opencodeGlobalAllowedDirectories,
 				opencodeRepositoryConfig: input.repository.opencode?.config,
 				opencodeStateScope:
 					input.repository.opencode?.stateScope ??

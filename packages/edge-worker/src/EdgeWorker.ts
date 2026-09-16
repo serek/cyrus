@@ -4,6 +4,7 @@ import { EventEmitter } from "node:events";
 import { existsSync, readFileSync } from "node:fs";
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
+import type * as LinearSDK from "@linear/sdk";
 import { LinearClient } from "@linear/sdk";
 import type {
 	McpServerConfig,
@@ -183,6 +184,7 @@ import { GitService } from "./GitService.js";
 import { GlobalSessionRegistry } from "./GlobalSessionRegistry.js";
 import { McpConfigService } from "./McpConfigService.js";
 import { McpHealthMonitor } from "./McpHealthMonitor.js";
+import { registerOpenCodePluginTelemetryEndpoint } from "./OpenCodePluginTelemetryEndpoint.js";
 import { PromptBuilder } from "./PromptBuilder.js";
 import type {
 	IssueContextResult,
@@ -230,6 +232,25 @@ export declare interface EdgeWorker {
 
 type CyrusToolsMcpContext = {
 	contextId?: string;
+};
+
+/**
+ * A Linear prompt received while OpenCode is still executing. OpenCode's CLI
+ * runner is turn-based, so these must wait for its `complete` event rather
+ * than being treated as an instruction to stop the active process.
+ */
+type DeferredOpenCodePrompt = {
+	session: CyrusAgentSession;
+	repository: RepositoryConfig;
+	sessionId: string;
+	agentSessionManager: AgentSessionManager;
+	promptBody: string;
+	attachmentManifest: string;
+	isNewSession: boolean;
+	additionalAllowedDirs: string[];
+	linearWorkspaceId: string;
+	commentAuthor?: string;
+	commentTimestamp?: string;
 };
 
 /**
@@ -318,6 +339,14 @@ export class EdgeWorker extends EventEmitter {
 	// GitHub webhook handlers share a PR worktree, so only one may run per PR.
 	private activeGitHubPrSessions = new Set<string>();
 	private queuedGitHubPrEvents = new Map<string, GitHubCommentWebhookEvent[]>();
+	/**
+	 * OpenCode cannot accept a second prompt while its CLI invocation is live.
+	 * Keep Linear prompts in order and resume the same OpenCode session after the
+	 * active turn naturally completes.
+	 */
+	private deferredOpenCodePrompts = new Map<string, DeferredOpenCodePrompt[]>();
+	private openCodeIdleListeners = new Map<string, IAgentRunner>();
+	private flushingDeferredOpenCodePrompts = new Set<string>();
 	/** Handler for AskUserQuestion tool invocations via Linear select signal */
 	private askUserQuestionHandler: AskUserQuestionHandler;
 	/** User access control for whitelisting/blacklisting Linear users */
@@ -1472,6 +1501,7 @@ export class EdgeWorker extends EventEmitter {
 
 		// 5. Register /version endpoint for CLI version info
 		this.registerVersionEndpoint();
+		this.registerOpenCodePluginTelemetryEndpoint();
 	}
 
 	/**
@@ -1505,6 +1535,16 @@ export class EdgeWorker extends EventEmitter {
 
 		this.logger.info("✅ Version endpoint registered");
 		this.logger.info("   Route: GET /version");
+	}
+
+	private registerOpenCodePluginTelemetryEndpoint(): void {
+		const registered = registerOpenCodePluginTelemetryEndpoint(
+			this.sharedApplicationServer.getFastifyInstance(),
+			this.agentSessionManager,
+			process.env.CYRUS_OPENCODE_TELEMETRY_TOKEN,
+		);
+		if (registered)
+			this.logger.info("OpenCode plugin telemetry endpoint registered");
 	}
 
 	/**
@@ -1705,6 +1745,8 @@ export class EdgeWorker extends EventEmitter {
 			},
 			getOpenCodeGlobalConfig: () => this.config.opencode?.config,
 			getOpenCodeGlobalStateScope: () => this.config.opencode?.stateScope,
+			getOpenCodeGlobalAllowedDirectories: () =>
+				this.config.opencode?.allowedDirectories,
 			onWebhookStart: () => {
 				this.activeWebhookCount++;
 			},
@@ -2256,7 +2298,11 @@ export class EdgeWorker extends EventEmitter {
 			const allowedTools =
 				this.toolPermissionResolver.buildGithubAllowedTools(repository);
 			const disallowedTools = this.buildDisallowedTools(repository);
-			const allowedDirectories: string[] = [repository.repositoryPath];
+			const allowedDirectories: string[] = [
+				repository.repositoryPath,
+				...(this.config.opencode?.allowedDirectories ?? []),
+				...(repository.opencode?.allowedDirectories ?? []),
+			];
 
 			// Create agent runner using the standard config builder
 			const { config: runnerConfig, runnerType } =
@@ -2992,7 +3038,11 @@ ${taskSection}`;
 			const allowedTools =
 				this.toolPermissionResolver.buildGithubAllowedTools(repository);
 			const disallowedTools = this.buildDisallowedTools(repository);
-			const allowedDirectories: string[] = [repository.repositoryPath];
+			const allowedDirectories: string[] = [
+				repository.repositoryPath,
+				...(this.config.opencode?.allowedDirectories ?? []),
+				...(repository.opencode?.allowedDirectories ?? []),
+			];
 
 			// Create agent runner using the standard config builder
 			const { config: runnerConfig, runnerType } =
@@ -4114,7 +4164,7 @@ ${taskSection}`;
 			} else if (isIssueCommentMentionWebhook(webhook)) {
 				return;
 			} else if (isIssueNewCommentWebhook(webhook)) {
-				return;
+				await this.handleIssueOwnerCommentWebhook(webhook);
 			} else if (isIssueUnassignedWebhook(webhook)) {
 				// Keep unassigned webhook active
 				await this.handleIssueUnassignedWebhook(webhook);
@@ -4154,6 +4204,74 @@ ${taskSection}`;
 			// Always decrement counter when webhook processing completes
 			this.activeWebhookCount--;
 		}
+	}
+
+	/**
+	 * Continue an active session when its owner adds an ordinary issue comment.
+	 *
+	 * Linear sends `issueNewComment` to the app for every issue comment. That is
+	 * not an instruction for Cyrus by itself: only the user who created the
+	 * active agent session may use this shortcut. Mentions still create their
+	 * normal Linear agent-session events, and comments from everybody else stay
+	 * inert unless Linear explicitly prompts Cyrus.
+	 */
+	private async handleIssueOwnerCommentWebhook(
+		webhook: LinearSDK.LinearDocument.AppUserNotificationWebhookPayload,
+	): Promise<void> {
+		const notification = webhook.notification as {
+			actorId?: string | null;
+			comment?: { id?: string; body?: string; userId?: string };
+			issue?: WebhookIssue;
+			issueId?: string;
+		};
+		const issue = notification.issue;
+		const comment = notification.comment;
+		const commentAuthorId = comment?.userId;
+		const actorId = notification.actorId;
+
+		// Both identifiers describe the author on Linear's webhook. Requiring a
+		// matching pair prevents a malformed or recipient-oriented notification
+		// from being mistaken for a command by the session owner.
+		if (
+			!issue ||
+			!comment?.id ||
+			typeof comment.body !== "string" ||
+			!commentAuthorId ||
+			!actorId ||
+			commentAuthorId !== actorId
+		) {
+			return;
+		}
+
+		const ownedSessions = this.agentSessionManager
+			.getActiveSessionsByIssueId(issue.id)
+			.filter((session) => session.creator?.id === commentAuthorId);
+
+		// Do not choose arbitrarily when an issue has multiple active sessions
+		// owned by the same user. An explicit Linear prompt remains unambiguous.
+		if (ownedSessions.length !== 1) {
+			return;
+		}
+
+		const session = ownedSessions[0]!;
+		const promptedWebhook = {
+			type: "AgentSessionEvent",
+			action: "prompted",
+			createdAt: webhook.createdAt,
+			organizationId: webhook.organizationId,
+			agentSession: {
+				id: session.id,
+				issue,
+				creator: session.creator,
+				comment,
+			},
+			agentActivity: {
+				content: { body: comment.body },
+				sourceCommentId: comment.id,
+			},
+		} as AgentSessionPromptedWebhook;
+
+		await this.handleUserPromptedAgentActivity(promptedWebhook);
 	}
 
 	// ============================================================================
@@ -8058,6 +8176,8 @@ ${input.userComment}
 			plugins,
 			opencodeGlobalConfig: this.config.opencode?.config,
 			opencodeGlobalStateScope: this.config.opencode?.stateScope,
+			opencodeGlobalAllowedDirectories:
+				this.config.opencode?.allowedDirectories,
 			skills: allowedSkillNames,
 			sandboxSettings: this.sdkSandboxSettings ?? undefined,
 			egressCaCertPath: this.egressCaCertPath ?? undefined,
@@ -8069,6 +8189,27 @@ ${input.userComment}
 				this.createAskUserQuestionCallback(sid, wid)!,
 			requireLinearWorkspaceId,
 		});
+
+		if (
+			result.runnerType === "opencode" &&
+			process.env.CYRUS_OPENCODE_TELEMETRY_TOKEN?.trim()
+		) {
+			const issueId = session.issueContext?.issueId ?? session.issueId;
+			if (issueId) {
+				const port = this.config.serverPort || this.config.webhookPort || 3456;
+				const openCodeConfig = result.config as AgentRunnerConfig & {
+					env?: Record<string, string | undefined>;
+				};
+				openCodeConfig.env = {
+					...openCodeConfig.env,
+					CYRUS_OPENCODE_TELEMETRY_ENDPOINT: `http://127.0.0.1:${port}/internal/opencode-plugin-telemetry`,
+					CYRUS_OPENCODE_TELEMETRY_TOKEN:
+						process.env.CYRUS_OPENCODE_TELEMETRY_TOKEN,
+					CYRUS_OPENCODE_TELEMETRY_AGENT_SESSION_ID: sessionId,
+					CYRUS_OPENCODE_TELEMETRY_ISSUE_ID: issueId,
+				};
+			}
+		}
 
 		// Attach pre-warmed session if available (only for Claude runner).
 		// Skipped entirely when warm sessions are not enabled.
@@ -8698,6 +8839,126 @@ ${input.userComment}
 	}
 
 	/**
+	 * OpenCode currently runs one CLI turn at a time. Its runner emits `complete`
+	 * when that turn has naturally ended, but does not accept streaming input.
+	 * Keep this structural check local to the routing boundary so a future
+	 * runner-side enqueue capability can replace the completion listener without
+	 * changing Linear prompt routing.
+	 */
+	private isOpenCodeRunner(
+		session: CyrusAgentSession,
+		runner: IAgentRunner,
+	): boolean {
+		return (
+			Boolean(session.opencodeSessionId) || runner instanceof OpenCodeRunner
+		);
+	}
+
+	private deferOpenCodePrompt(prompt: DeferredOpenCodePrompt): void {
+		const queued = this.deferredOpenCodePrompts.get(prompt.sessionId) ?? [];
+		queued.push(prompt);
+		this.deferredOpenCodePrompts.set(prompt.sessionId, queued);
+
+		const runner = prompt.session.agentRunner;
+		if (!runner?.isRunning()) {
+			void this.flushDeferredOpenCodePrompts(prompt.sessionId);
+			return;
+		}
+
+		this.waitForOpenCodeIdle(prompt.sessionId, runner);
+	}
+
+	private waitForOpenCodeIdle(sessionId: string, runner: IAgentRunner): void {
+		if (this.openCodeIdleListeners.get(sessionId) === runner) return;
+
+		// `complete` is the small adapter seam between routing and OpenCode's
+		// turn-based CLI. OpenCodeRunner implements it today. Do not stop or
+		// replace a live runner if a future implementation omits this capability:
+		// the queued prompt remains in this worker until that adapter is
+		// supplied by the runner package.
+		const completionEmitter = runner as IAgentRunner & {
+			once?: (event: "complete", listener: () => void) => unknown;
+		};
+		if (typeof completionEmitter.once !== "function") {
+			this.logger.warn(
+				`OpenCode prompt queued for ${sessionId}, but the active runner does not expose a complete event; delivery requires a runner-side idle callback`,
+			);
+			return;
+		}
+
+		this.openCodeIdleListeners.set(sessionId, runner);
+		completionEmitter.once("complete", () => {
+			if (this.openCodeIdleListeners.get(sessionId) === runner) {
+				this.openCodeIdleListeners.delete(sessionId);
+			}
+			void this.flushDeferredOpenCodePrompts(sessionId);
+		});
+
+		// Close the race where the runner completed after the caller checked
+		// isRunning(), but before its completion listener was attached.
+		if (!runner.isRunning()) {
+			this.openCodeIdleListeners.delete(sessionId);
+			void this.flushDeferredOpenCodePrompts(sessionId);
+		}
+	}
+
+	private async flushDeferredOpenCodePrompts(sessionId: string): Promise<void> {
+		if (this.flushingDeferredOpenCodePrompts.has(sessionId)) return;
+		this.flushingDeferredOpenCodePrompts.add(sessionId);
+
+		try {
+			while (true) {
+				const queued = this.deferredOpenCodePrompts.get(sessionId);
+				const next = queued?.[0];
+				if (!next) {
+					this.deferredOpenCodePrompts.delete(sessionId);
+					return;
+				}
+
+				const currentSession =
+					next.agentSessionManager.getSession(sessionId) ?? next.session;
+				const currentRunner = currentSession.agentRunner;
+				if (currentRunner?.isRunning()) {
+					if (this.isOpenCodeRunner(currentSession, currentRunner)) {
+						this.waitForOpenCodeIdle(sessionId, currentRunner);
+					} else {
+						this.logger.warn(
+							`OpenCode prompt remains queued for ${sessionId}: a different runner is active`,
+						);
+					}
+					return;
+				}
+
+				try {
+					await this.resumeAgentSession(
+						currentSession,
+						next.repository,
+						sessionId,
+						next.agentSessionManager,
+						next.promptBody,
+						next.attachmentManifest,
+						next.isNewSession,
+						next.additionalAllowedDirs,
+						next.linearWorkspaceId,
+						undefined,
+						next.commentAuthor,
+						next.commentTimestamp,
+					);
+					queued.shift();
+				} catch (error) {
+					this.logger.error(
+						`Failed to deliver queued OpenCode prompt for ${sessionId}; it will remain queued for retry`,
+						error,
+					);
+					return;
+				}
+			}
+		} finally {
+			this.flushingDeferredOpenCodePrompts.delete(sessionId);
+		}
+	}
+
+	/**
 	 * Handle prompt with streaming check - centralized logic for all input types
 	 *
 	 * This method implements the unified pattern for handling prompts:
@@ -8731,6 +8992,9 @@ ${input.userComment}
 	): Promise<boolean> {
 		const log = this.logger.withContext({ sessionId });
 		const existingRunner = session.agentRunner;
+		const fullPrompt = attachmentManifest
+			? `${promptBody}\n\n${attachmentManifest}`
+			: promptBody;
 
 		// Handle running case - add message to existing stream (if supported)
 		if (
@@ -8742,12 +9006,6 @@ ${input.userComment}
 				`Adding prompt to existing stream for ${sessionId} (${logContext})`,
 			);
 
-			// Append attachment manifest to the prompt if we have one
-			let fullPrompt = promptBody;
-			if (attachmentManifest) {
-				fullPrompt = `${promptBody}\n\n${attachmentManifest}`;
-			}
-
 			// `addStreamMessage` can reject the message if the turn ended in the
 			// race window between "still running" and "turn finished" (e.g. the
 			// Codex app-server backend, which only steers an active turn). Fall
@@ -8755,6 +9013,16 @@ ${input.userComment}
 			// streaming input never throws here, so this is a no-op for Claude.
 			try {
 				existingRunner.addStreamMessage(fullPrompt);
+				if (this.isOpenCodeRunner(session, existingRunner)) {
+					void agentSessionManager
+						.reportOpenCodeFollowUpQueued(sessionId)
+						.catch((error) =>
+							log.warn(
+								`Failed to publish OpenCode queue notice for ${sessionId}`,
+								error,
+							),
+						);
+				}
 				return true; // Message added to stream
 			} catch (error) {
 				log.warn(
@@ -8762,6 +9030,37 @@ ${input.userComment}
 					{ error: error instanceof Error ? error.message : String(error) },
 				);
 			}
+		}
+
+		if (
+			existingRunner?.isRunning() &&
+			this.isOpenCodeRunner(session, existingRunner)
+		) {
+			void agentSessionManager
+				.reportOpenCodeFollowUpQueued(sessionId)
+				.catch((error) =>
+					log.warn(
+						`Failed to publish OpenCode queue notice for ${sessionId}`,
+						error,
+					),
+				);
+			this.deferOpenCodePrompt({
+				session,
+				repository,
+				sessionId,
+				agentSessionManager,
+				promptBody,
+				attachmentManifest,
+				isNewSession,
+				additionalAllowedDirs,
+				linearWorkspaceId,
+				commentAuthor,
+				commentTimestamp,
+			});
+			log.info(
+				`Queued prompt for active OpenCode session ${sessionId}; it will resume after the current turn completes (${logContext})`,
+			);
+			return true;
 		}
 
 		// Not streaming (or streaming was rejected) - resume/start session
@@ -9023,8 +9322,36 @@ ${input.userComment}
 			}
 		}
 
-		// Stop existing runner if it's not running
-		if (existingRunner) {
+		// OpenCode has no streaming-input transport. A Linear prompt arriving
+		// mid-turn must wait for the current turn's natural completion; stopping
+		// here would discard the active work solely because the transport differs.
+		if (
+			existingRunner?.isRunning() &&
+			this.isOpenCodeRunner(session, existingRunner)
+		) {
+			this.deferOpenCodePrompt({
+				session,
+				repository,
+				sessionId,
+				agentSessionManager,
+				promptBody,
+				attachmentManifest,
+				isNewSession,
+				additionalAllowedDirs: additionalAllowedDirectories,
+				linearWorkspaceId:
+					linearWorkspaceId ?? requireLinearWorkspaceId(repository),
+				commentAuthor,
+				commentTimestamp,
+			});
+			log.info(
+				`Queued prompt for active OpenCode session ${sessionId}; it will resume after the current turn completes`,
+			);
+			return;
+		}
+
+		// The old runner is already idle. There is no need to stop it before
+		// constructing the resumed turn.
+		if (existingRunner?.isRunning()) {
 			existingRunner.stop();
 		}
 

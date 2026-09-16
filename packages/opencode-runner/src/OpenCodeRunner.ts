@@ -23,6 +23,8 @@ import type {
 	OpenCodeSessionInfo,
 	OpenCodeStepFinishEvent,
 	OpenCodeToolUseEvent,
+	RunnerHealthEvent,
+	RunnerHealthSnapshot,
 } from "./types.js";
 
 const FORCE_KILL_DELAY_MS = 5_000;
@@ -326,7 +328,12 @@ export declare interface OpenCodeRunner {
 }
 
 export class OpenCodeRunner extends EventEmitter implements IAgentRunner {
-	readonly supportsStreamingInput = false;
+	/**
+	 * OpenCode's `run` command does not expose a reachable session API while a
+	 * turn is active. Additional input is therefore queued and started as the
+	 * next `--session` turn, without interrupting the active child process.
+	 */
+	readonly supportsStreamingInput = true;
 
 	private readonly config: OpenCodeRunnerConfig;
 	private readonly formatter: IMessageFormatter;
@@ -349,6 +356,8 @@ export class OpenCodeRunner extends EventEmitter implements IAgentRunner {
 	private hasFinalized = false;
 	private stderr = "";
 	private nonJsonStartupOutput: string[] = [];
+	private queuedPrompts: string[] = [];
+	private health: RunnerHealthSnapshot = this.createInitialHealthSnapshot();
 
 	constructor(config: OpenCodeRunnerConfig) {
 		super();
@@ -378,12 +387,19 @@ export class OpenCodeRunner extends EventEmitter implements IAgentRunner {
 			return this.sessionInfo;
 		}
 
+		return this.runTurn(prompt, this.config.resumeSessionId);
+	}
+
+	private runTurn(
+		prompt: string,
+		resumeSessionId?: string,
+	): Promise<OpenCodeSessionInfo> {
 		return new Promise<OpenCodeSessionInfo>((resolve) => {
 			let stdoutBuffer = "";
 			let inactivityTimer: NodeJS.Timeout | undefined;
 			let forceKillTimer: NodeJS.Timeout | undefined;
 			const inactivityTimeoutMs = this.config.inactivityTimeoutMs;
-			const args = this.buildArgs();
+			const args = this.buildArgs(resumeSessionId);
 			const inputPrompt = this.buildInputPrompt(prompt);
 			const runtimeEnv = this.buildRuntimeEnv();
 			ensureOpenCodeStateDirectories(runtimeEnv);
@@ -397,6 +413,17 @@ export class OpenCodeRunner extends EventEmitter implements IAgentRunner {
 				stdio: ["pipe", "pipe", "pipe"],
 			});
 			this.process = child;
+			this.health = {
+				state: "running",
+				pid: child.pid ?? null,
+				sessionId: this.sessionInfo?.sessionId ?? null,
+				turn: this.health.turn + 1,
+				lastEvent: "spawn",
+				lastEventAt: Date.now(),
+				exitCode: null,
+				exitSignal: null,
+				queuedFollowUpCount: this.queuedPrompts.length,
+			};
 			const clearInactivityTimers = () => {
 				if (inactivityTimer) clearTimeout(inactivityTimer);
 				if (forceKillTimer) clearTimeout(forceKillTimer);
@@ -428,6 +455,7 @@ export class OpenCodeRunner extends EventEmitter implements IAgentRunner {
 
 			child.stdout.on("data", (chunk: Buffer) => {
 				refreshInactivityTimer();
+				this.recordHealthEvent("stdout");
 				stdoutBuffer += chunk.toString("utf8");
 				const lines = stdoutBuffer.split(/\r?\n/);
 				stdoutBuffer = lines.pop() || "";
@@ -438,11 +466,13 @@ export class OpenCodeRunner extends EventEmitter implements IAgentRunner {
 
 			child.stderr.on("data", (chunk: Buffer) => {
 				refreshInactivityTimer();
+				this.recordHealthEvent("stderr");
 				this.stderr += chunk.toString("utf8");
 			});
 
 			child.on("error", (error) => {
 				clearInactivityTimers();
+				this.recordProcessError(child);
 				this.finalizeSession(error);
 				resolve(this.sessionInfo as OpenCodeSessionInfo);
 			});
@@ -452,6 +482,7 @@ export class OpenCodeRunner extends EventEmitter implements IAgentRunner {
 				if (stdoutBuffer.trim()) {
 					this.handleLine(stdoutBuffer);
 				}
+				this.recordExit(code, signal);
 
 				let error: Error | undefined;
 				if (this.wasStopped) {
@@ -463,6 +494,14 @@ export class OpenCodeRunner extends EventEmitter implements IAgentRunner {
 					error = new Error(`OpenCode exited with code ${code}${suffix}`);
 				} else if (signal) {
 					error = new Error(`OpenCode exited with signal ${signal}`);
+				}
+
+				const nextPrompt = !error ? this.queuedPrompts.shift() : undefined;
+				const sessionId = this.sessionInfo?.sessionId;
+				if (nextPrompt !== undefined && sessionId) {
+					this.pendingResultMessage = null;
+					this.runTurn(nextPrompt, sessionId).then(resolve);
+					return;
 				}
 
 				this.finalizeSession(error);
@@ -478,7 +517,13 @@ export class OpenCodeRunner extends EventEmitter implements IAgentRunner {
 	}
 
 	addStreamMessage(_content: string): void {
-		throw new Error("OpenCodeRunner does not support streaming input messages");
+		if (!this.isRunning()) {
+			throw new Error(
+				"Cannot queue an OpenCode message when the session is not running",
+			);
+		}
+		this.queuedPrompts.push(_content);
+		this.recordHealthEvent("queue");
 	}
 
 	completeStream(): void {
@@ -505,6 +550,10 @@ export class OpenCodeRunner extends EventEmitter implements IAgentRunner {
 		return this.formatter;
 	}
 
+	getHealthSnapshot(): RunnerHealthSnapshot {
+		return { ...this.health };
+	}
+
 	private resetSessionState(): void {
 		this.messages = [];
 		this.process = null;
@@ -524,6 +573,8 @@ export class OpenCodeRunner extends EventEmitter implements IAgentRunner {
 		this.hasFinalized = false;
 		this.stderr = "";
 		this.nonJsonStartupOutput = [];
+		this.queuedPrompts = [];
+		this.health = this.createInitialHealthSnapshot();
 	}
 
 	private validateModelSelector(): Error | undefined {
@@ -547,7 +598,7 @@ export class OpenCodeRunner extends EventEmitter implements IAgentRunner {
 		return buildOpenCodeRuntimeEnv(this.config);
 	}
 
-	private buildArgs(): string[] {
+	private buildArgs(resumeSessionId?: string): string[] {
 		const args = [
 			"run",
 			"--format",
@@ -567,8 +618,8 @@ export class OpenCodeRunner extends EventEmitter implements IAgentRunner {
 		if (this.config.agent) {
 			args.push("--agent", this.config.agent);
 		}
-		if (this.config.resumeSessionId) {
-			args.push("--session", this.config.resumeSessionId);
+		if (resumeSessionId) {
+			args.push("--session", resumeSessionId);
 		}
 
 		return args;
@@ -603,6 +654,7 @@ export class OpenCodeRunner extends EventEmitter implements IAgentRunner {
 	}
 
 	private handleEvent(event: OpenCodeJsonEvent): void {
+		this.recordHealthEvent("stream_event");
 		this.emit("streamEvent", event);
 
 		switch (event.type) {
@@ -612,6 +664,7 @@ export class OpenCodeRunner extends EventEmitter implements IAgentRunner {
 				if (this.sessionInfo) {
 					this.sessionInfo.sessionId = sessionId;
 				}
+				this.health.sessionId = sessionId;
 				this.emitSystemInitMessage(sessionId);
 				break;
 			}
@@ -831,6 +884,42 @@ export class OpenCodeRunner extends EventEmitter implements IAgentRunner {
 		this.pushMessage(this.pendingResultMessage);
 		this.pendingResultMessage = null;
 		this.emit("complete", [...this.messages]);
+	}
+
+	private createInitialHealthSnapshot(): RunnerHealthSnapshot {
+		return {
+			state: "idle",
+			pid: null,
+			sessionId: null,
+			turn: 0,
+			lastEvent: null,
+			lastEventAt: null,
+			exitCode: null,
+			exitSignal: null,
+			queuedFollowUpCount: 0,
+		};
+	}
+
+	private recordHealthEvent(event: RunnerHealthEvent): void {
+		this.health.lastEvent = event;
+		this.health.lastEventAt = Date.now();
+		this.health.queuedFollowUpCount = this.queuedPrompts.length;
+	}
+
+	private recordExit(code: number | null, signal: NodeJS.Signals | null): void {
+		this.health.state = "exited";
+		this.health.pid = null;
+		this.health.exitCode = code;
+		this.health.exitSignal = signal;
+		this.recordHealthEvent("exit");
+	}
+
+	private recordProcessError(child: ChildProcessWithoutNullStreams): void {
+		this.health.state = "exited";
+		this.health.pid = null;
+		this.health.exitCode = child.exitCode;
+		this.health.exitSignal = child.signalCode;
+		this.recordHealthEvent("error");
 	}
 
 	private pushMessage(message: SDKMessage): void {

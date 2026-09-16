@@ -191,6 +191,23 @@ describe("OpenCode config translation", () => {
 		);
 	});
 
+	it("translates configured external runtime directories into scoped grants", () => {
+		const result = buildOpenCodeConfig({
+			workingDirectory: "/work/repo",
+			cyrusHome: "/tmp/cyrus",
+			allowedDirectories: [
+				"/work/repo",
+				"/Users/serek/.omo/orchestration/hedge-os",
+			],
+			allowedTools: ["Read(**)"],
+		});
+
+		expect(result.config.permission?.external_directory).toEqual({
+			"*": "deny",
+			"/Users/serek/.omo/orchestration/hedge-os/**": "allow",
+		});
+	});
+
 	it("allows standard issue-session Bash and file tools through default-deny permissions", () => {
 		const result = buildOpenCodeConfig({
 			workingDirectory: "/work/repo",

@@ -93,6 +93,12 @@ export type OpenCodeStateScope = z.infer<typeof OpenCodeStateScopeSchema>;
 
 export const OpenCodeConfigSchema = z.object({
 	stateScope: OpenCodeStateScopeSchema.optional(),
+	/**
+	 * Additional read/write roots that OpenCode may inspect outside its
+	 * session workspace. Keep this list narrow; it is translated into
+	 * session-scoped `external_directory` grants by the runner.
+	 */
+	allowedDirectories: z.array(z.string()).optional(),
 	config: JsonObjectSchema.optional(),
 });
 
