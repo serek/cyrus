@@ -30,6 +30,7 @@ import {
 	type SessionCreator,
 	type Workspace,
 } from "cyrus-core";
+import type { RunnerHealthSnapshot } from "cyrus-opencode-runner";
 
 import {
 	formatPendingWorkSummary,
@@ -37,11 +38,19 @@ import {
 	formatScheduleWakeupResponse,
 	tryParseScheduleWakeupInput,
 } from "./PendingWorkFormatter.js";
+import {
+	type OptionalPluginTelemetrySignal,
+	type RunnerHealthSignal,
+	SessionObservabilityProjection,
+} from "./SessionObservabilityProjection.js";
 import type {
 	ActivityPostOptions,
 	ActivitySignal,
 	IActivitySink,
 } from "./sinks/index.js";
+
+const OPENCODE_HEARTBEAT_INTERVAL_MS = 60_000;
+const OPENCODE_CHECKPOINT_TTL_MS = 15_000;
 
 /**
  * Events emitted by AgentSessionManager
@@ -206,6 +215,22 @@ export class AgentSessionManager extends EventEmitter {
 	// deferred tools like ToolSearch, where a tool_use and its tool_result can
 	// arrive back-to-back in the same microtask batch).
 	private messageProcessingQueues: Map<string, Promise<void>> = new Map();
+	/** Recent compact milestones, partitioned by agent session. */
+	private operatorFeedbackBySession: Map<string, Map<string, number>> =
+		new Map();
+	private lastOperatorProgressAt: Map<string, number> = new Map();
+	private operatorHeartbeatTimers: Map<string, ReturnType<typeof setInterval>> =
+		new Map();
+	/** The OpenCode turn currently attached to a Linear session. */
+	private openCodeTurnBySession: Map<string, number> = new Map();
+	/**
+	 * Lifecycle notices already posted for a turn. These are intentionally
+	 * bounded: a noisy runner must not turn Linear into a log stream.
+	 */
+	private openCodeLifecycleNotices: Set<string> = new Set();
+	/** Per-session projection state; never shared between concurrent sessions. */
+	private observabilityBySession: Map<string, SessionObservabilityProjection> =
+		new Map();
 	private getParentSessionId?: (childSessionId: string) => string | undefined;
 	private resumeParentSession?: (
 		parentSessionId: string,
@@ -500,9 +525,11 @@ export class AgentSessionManager extends EventEmitter {
 		}
 
 		const log = this.sessionLog(sessionId);
+		const isOpenCode = this.isOpenCodeSession(sessionId);
 
 		// Clear any active Task when session completes
 		this.activeTasksBySession.delete(sessionId);
+		this.stopOperatorHeartbeat(sessionId);
 
 		const wasStopRequested = this.consumeStopRequest(sessionId);
 		const status = wasStopRequested
@@ -530,6 +557,13 @@ export class AgentSessionManager extends EventEmitter {
 			// a post failure must not strand the issue lock, which only the
 			// terminal signal releases.
 			try {
+				if (isOpenCode) {
+					await this.postOpenCodeLifecycleNotice(
+						sessionId,
+						"operator-stop",
+						"OpenCode was stopped by an operator.",
+					);
+				}
 				await this.createErrorActivity(sessionId, "Session stopped by user.");
 			} catch (err) {
 				log.error("Failed to post stop activity:", err);
@@ -546,6 +580,15 @@ export class AgentSessionManager extends EventEmitter {
 		let pendingWork: AgentPendingWork | null = null;
 
 		try {
+			if (isOpenCode) {
+				await this.postOpenCodeLifecycleNotice(
+					sessionId,
+					resultMessage.subtype === "success" ? "completed" : "failed",
+					resultMessage.subtype === "success"
+						? "OpenCode completed this turn."
+						: "OpenCode ended unexpectedly.",
+				);
+			}
 			// Post final result to issue tracker.
 			await this.addResultEntry(sessionId, resultMessage);
 
@@ -914,6 +957,15 @@ export class AgentSessionManager extends EventEmitter {
 		opts?: { force?: boolean },
 	): Promise<void> {
 		this.activeTasksBySession.delete(linearAgentActivitySessionId);
+		this.stopOperatorHeartbeat(linearAgentActivitySessionId);
+		if (this.isOpenCodeSession(linearAgentActivitySessionId)) {
+			await this.postOpenCodeLifecycleNotice(
+				linearAgentActivitySessionId,
+				"operator-stop",
+				"OpenCode was stopped by an operator.",
+				"error",
+			);
+		}
 		await this.emitTerminalOnce(linearAgentActivitySessionId, "stopped", opts);
 	}
 
@@ -938,9 +990,17 @@ export class AgentSessionManager extends EventEmitter {
 	async failSession(sessionId: string, body: string): Promise<void> {
 		const log = this.sessionLog(sessionId);
 		this.activeTasksBySession.delete(sessionId);
+		this.stopOperatorHeartbeat(sessionId);
 		await this.updateSessionStatus(sessionId, AgentSessionStatus.Error);
 
 		try {
+			if (this.isOpenCodeSession(sessionId)) {
+				await this.postOpenCodeLifecycleNotice(
+					sessionId,
+					"failed",
+					"OpenCode ended unexpectedly.",
+				);
+			}
 			await this.createErrorActivity(sessionId, body);
 		} catch (err) {
 			log.error("Failed to post session-failure activity:", err);
@@ -1027,11 +1087,34 @@ export class AgentSessionManager extends EventEmitter {
 		message: SDKMessage,
 	): Promise<void> {
 		const log = this.sessionLog(sessionId);
+		const session = this.sessions.get(sessionId);
 		try {
+			// OpenCode's existing heartbeat needs a current output timestamp to
+			// distinguish a quiet-but-alive process from a stale stream. Recording
+			// this fact is silent; the heartbeat or an explicit health signal owns
+			// Linear-facing status activity so established timelines stay unchanged.
+			if (this.isOpenCodeSession(sessionId)) {
+				this.getObservabilityProjection(sessionId).recordRunner({
+					type: "output",
+				});
+			}
 			switch (message.type) {
 				case "system":
 					if (message.subtype === "init") {
+						const wasOpenCodeResume = Boolean(session?.opencodeSessionId);
 						this.updateAgentSessionWithRunnerSessionId(sessionId, message);
+						if (
+							session?.agentRunner &&
+							runnerTypeOf(session.agentRunner) === "opencode"
+						) {
+							await this.postOpenCodeLifecycleNotice(
+								sessionId,
+								wasOpenCodeResume ? "resumed" : "started",
+								wasOpenCodeResume
+									? "OpenCode resumed work on this request."
+									: "OpenCode started work on this request.",
+							);
+						}
 
 						// Post model notification
 						const systemMessage = message as SDKSystemMessage;
@@ -1056,6 +1139,17 @@ export class AgentSessionManager extends EventEmitter {
 						message as SDKUserMessage,
 					);
 					await this.syncEntryToActivitySink(userEntry, sessionId);
+					if (
+						session?.agentRunner &&
+						runnerTypeOf(session.agentRunner) === "opencode" &&
+						userEntry.metadata?.toolUseId
+					) {
+						await this.postOpenCodeCheckpoint(
+							sessionId,
+							`tool:${userEntry.metadata.toolUseId}:result`,
+							"OpenCode completed a tool step.",
+						);
+					}
 					break;
 				}
 
@@ -1083,6 +1177,16 @@ export class AgentSessionManager extends EventEmitter {
 						// then post immediately for real-time "in progress" display
 						await this.flushBufferedAssistant(sessionId);
 						await this.syncEntryToActivitySink(assistantEntry, sessionId);
+						if (
+							session?.agentRunner &&
+							runnerTypeOf(session.agentRunner) === "opencode"
+						) {
+							await this.postOpenCodeCheckpoint(
+								sessionId,
+								`tool:${assistantEntry.metadata.toolUseId}:start`,
+								"OpenCode started a tool step.",
+							);
+						}
 					} else {
 						// Text-only message: buffer it so the LAST one can be posted as "response"
 						// Flush any previous buffered text first (posts as thought)
@@ -1975,6 +2079,13 @@ export class AgentSessionManager extends EventEmitter {
 			// Best-effort: a failed post must not stop the terminal signal, which is
 			// the only thing that releases the router's issue lock and affinity.
 			try {
+				if (this.isOpenCodeSession(sessionId)) {
+					await this.postOpenCodeLifecycleNotice(
+						sessionId,
+						"failed",
+						"OpenCode ended unexpectedly.",
+					);
+				}
 				await this.createErrorActivity(
 					sessionId,
 					"Session interrupted — the agent host restarted before this session finished. Send a new message to resume it.",
@@ -2032,6 +2143,14 @@ export class AgentSessionManager extends EventEmitter {
 		session.terminalState = undefined;
 
 		session.agentRunner = agentRunner;
+		if (runnerTypeOf(agentRunner) === "opencode") {
+			this.openCodeTurnBySession.set(
+				sessionId,
+				(this.openCodeTurnBySession.get(sessionId) ?? 0) + 1,
+			);
+			this.startOperatorHeartbeat(sessionId);
+		}
+		this.getObservabilityProjection(sessionId).recordRunner({ type: "alive" });
 		session.updatedAt = Date.now();
 		log.debug(`Added agent runner`);
 		this.emit("sessionResumed", sessionId);
@@ -2222,6 +2341,196 @@ export class AgentSessionManager extends EventEmitter {
 		}
 	}
 
+	private startOperatorHeartbeat(sessionId: string): void {
+		if (this.operatorHeartbeatTimers.has(sessionId)) return;
+		const timer = setInterval(() => {
+			const session = this.sessions.get(sessionId);
+			if (!session || session.status !== AgentSessionStatus.Active) {
+				this.stopOperatorHeartbeat(sessionId);
+				return;
+			}
+			const now = Date.now();
+			const lastProgress = this.lastOperatorProgressAt.get(sessionId) ?? now;
+			if (now - lastProgress < OPENCODE_HEARTBEAT_INTERVAL_MS) return;
+			this.lastOperatorProgressAt.set(sessionId, now);
+			void this.reportCurrentRunnerHealth(sessionId, now);
+			const rolling = this.getObservabilityProjection(sessionId).status(now);
+			const elapsedMinutes = Math.floor(rolling.elapsedMs / 60_000);
+			const elapsedSeconds = Math.floor((rolling.elapsedMs % 60_000) / 1_000);
+			const elapsed = `${elapsedMinutes}m ${elapsedSeconds}s`;
+			const progress = rolling.todo
+				? ` · ${rolling.todo.completed}/${rolling.todo.total} done`
+				: "";
+			const attention =
+				rolling.attention.length > 0
+					? ` · ${rolling.attention.join(", ")}`
+					: "";
+			void this.postActivity(
+				sessionId,
+				{
+					ephemeral: true,
+					content: {
+						type: "thought",
+						body: `OpenCode active · ${rolling.phase ?? "working"} · ${elapsed}${progress}${attention}`,
+					},
+				},
+				"CEO status",
+			);
+		}, OPENCODE_HEARTBEAT_INTERVAL_MS);
+		// A feedback timer must never keep the worker alive by itself.
+		timer.unref?.();
+		this.operatorHeartbeatTimers.set(sessionId, timer);
+		this.lastOperatorProgressAt.set(sessionId, Date.now());
+	}
+
+	private stopOperatorHeartbeat(sessionId: string): void {
+		const timer = this.operatorHeartbeatTimers.get(sessionId);
+		if (timer) clearInterval(timer);
+		this.operatorHeartbeatTimers.delete(sessionId);
+	}
+
+	private async postOpenCodeCheckpoint(
+		sessionId: string,
+		key: string,
+		body: string,
+	): Promise<void> {
+		const now = Date.now();
+		const checkpoints =
+			this.operatorFeedbackBySession.get(sessionId) ??
+			new Map<string, number>();
+		const previousAt = checkpoints.get(key);
+		if (
+			previousAt !== undefined &&
+			now - previousAt < OPENCODE_CHECKPOINT_TTL_MS
+		)
+			return;
+		checkpoints.set(key, now);
+		this.operatorFeedbackBySession.set(sessionId, checkpoints);
+		this.lastOperatorProgressAt.set(sessionId, now);
+		await this.postActivity(
+			sessionId,
+			{ content: { type: "thought", body } },
+			"OpenCode checkpoint",
+		);
+	}
+
+	/**
+	 * Emits a deduplicated Linear-facing health activity. This is intentionally
+	 * observation-only: neither a stale stream nor an optional plugin failure
+	 * stops, restarts, or otherwise mutates the attached runner.
+	 */
+	async reportRunnerHealth(
+		sessionId: string,
+		signal: RunnerHealthSignal,
+	): Promise<void> {
+		const projection = this.getObservabilityProjection(sessionId);
+		projection.recordRunner(signal);
+		const activity = projection.takeHealthActivity(
+			signal.type === "snapshot"
+				? (signal.snapshot.lastEventAt ?? Date.now())
+				: (signal.at ?? Date.now()),
+		);
+		if (!activity) return;
+		await this.postActivity(sessionId, { content: activity }, "runner health");
+	}
+
+	private async reportCurrentRunnerHealth(
+		sessionId: string,
+		now: number,
+	): Promise<void> {
+		const runner = this.sessions.get(sessionId)?.agentRunner as
+			| (IAgentRunner & {
+					getHealthSnapshot?: () => RunnerHealthSnapshot;
+			  })
+			| undefined;
+		const snapshot = runner?.getHealthSnapshot?.();
+		await this.reportRunnerHealth(
+			sessionId,
+			snapshot ? { type: "snapshot", snapshot } : { type: "alive", at: now },
+		);
+	}
+
+	/**
+	 * Generic ingress for optional plugin phase/tool/gate/review/final signals.
+	 * Plugin availability contributes to the same health sentence as runner
+	 * liveness; it is never a lifecycle command.
+	 */
+	async reportOptionalPluginTelemetry(
+		sessionId: string,
+		signal: OptionalPluginTelemetrySignal,
+	): Promise<void> {
+		const projection = this.getObservabilityProjection(sessionId);
+		const semanticActivity = projection.recordPlugin(signal);
+		if (semanticActivity) {
+			await this.postActivity(
+				sessionId,
+				{ content: semanticActivity },
+				"optional plugin telemetry",
+			);
+		}
+		const healthActivity = projection.takeHealthActivity();
+		if (healthActivity) {
+			await this.postActivity(
+				sessionId,
+				{ content: healthActivity },
+				"runner health",
+			);
+		}
+	}
+
+	private getObservabilityProjection(
+		sessionId: string,
+	): SessionObservabilityProjection {
+		let projection = this.observabilityBySession.get(sessionId);
+		if (!projection) {
+			projection = new SessionObservabilityProjection({
+				staleOutputAfterMs: OPENCODE_HEARTBEAT_INTERVAL_MS,
+			});
+			this.observabilityBySession.set(sessionId, projection);
+		}
+		return projection;
+	}
+
+	/**
+	 * Report that a Linear follow-up will be delivered after the live OpenCode
+	 * turn ends. EdgeWorker owns the queue; this manager owns the safe, bounded
+	 * Linear-facing lifecycle notice.
+	 */
+	async reportOpenCodeFollowUpQueued(sessionId: string): Promise<void> {
+		if (!this.isOpenCodeSession(sessionId)) return;
+		await this.postOpenCodeLifecycleNotice(
+			sessionId,
+			"follow-up-queued",
+			"A follow-up is queued and will be handled after this OpenCode turn.",
+		);
+	}
+
+	private isOpenCodeSession(sessionId: string): boolean {
+		const session = this.sessions.get(sessionId);
+		return Boolean(
+			session?.opencodeSessionId ||
+				(session?.agentRunner &&
+					runnerTypeOf(session.agentRunner) === "opencode"),
+		);
+	}
+
+	private async postOpenCodeLifecycleNotice(
+		sessionId: string,
+		phase: string,
+		body: string,
+		type: "thought" | "error" = "thought",
+	): Promise<void> {
+		const turn = this.openCodeTurnBySession.get(sessionId) ?? 0;
+		const key = `${sessionId}:${turn}:${phase}`;
+		if (this.openCodeLifecycleNotices.has(key)) return;
+		this.openCodeLifecycleNotices.add(key);
+		await this.postActivity(
+			sessionId,
+			{ content: { type, body } },
+			"OpenCode lifecycle",
+		);
+	}
+
 	/**
 	 * Create a thought activity
 	 */
@@ -2321,6 +2630,16 @@ export class AgentSessionManager extends EventEmitter {
 		this.lastAssistantBodyBySession.delete(sessionId);
 		this.bufferedAssistantEntryBySession.delete(sessionId);
 		this.messageProcessingQueues.delete(sessionId);
+		this.stopOperatorHeartbeat(sessionId);
+		this.operatorFeedbackBySession.delete(sessionId);
+		this.lastOperatorProgressAt.delete(sessionId);
+		this.openCodeTurnBySession.delete(sessionId);
+		this.observabilityBySession.delete(sessionId);
+		for (const key of this.openCodeLifecycleNotices) {
+			if (key.startsWith(`${sessionId}:`)) {
+				this.openCodeLifecycleNotices.delete(key);
+			}
+		}
 		log.debug("Removed session");
 	}
 

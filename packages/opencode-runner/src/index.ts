@@ -6,4 +6,7 @@ export type {
 	OpenCodeRunnerConfig,
 	OpenCodeRunnerEvents,
 	OpenCodeSessionInfo,
+	RunnerHealthEvent,
+	RunnerHealthSnapshot,
+	RunnerHealthState,
 } from "./types.js";

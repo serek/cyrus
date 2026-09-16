@@ -199,4 +199,299 @@ describe("AgentSessionManager - OpenCode activity mapping", () => {
 			),
 		).toBe(true);
 	});
+
+	it.each([2, 3, 5])(
+		"keeps %i concurrent OpenCode sessions and Linear activities isolated",
+		async (sessionCount) => {
+			const dir = makeTempDir();
+			const script = join(dir, "fake-concurrent-opencode.mjs");
+			writeFileSync(
+				script,
+				`#!/usr/bin/env node
+import { readFileSync } from "node:fs";
+const prompt = readFileSync(0, "utf8");
+const lane = prompt.match(/lane-(\\d+)/)?.[1] ?? "unknown";
+process.stdout.write(JSON.stringify({ type: "step_start", sessionID: "oc_" + lane }) + "\\n");
+process.stdout.write(JSON.stringify({ type: "text", part: { text: lane + " progress" } }) + "\\n");
+process.stdout.write(JSON.stringify({ type: "text", part: { text: lane + " final" } }) + "\\n");
+process.stdout.write(JSON.stringify({ type: "step_finish", result: lane + " complete" }) + "\\n");
+`,
+				{ mode: 0o755 },
+			);
+
+			const sinkFor = (id: string) => ({
+				id,
+				postActivity: vi
+					.fn()
+					.mockResolvedValue({ activityId: `${id}-activity` }),
+				createAgentSession: vi.fn().mockResolvedValue(`${id}-external`),
+			});
+			const sessions = Array.from({ length: sessionCount }, (_, index) => {
+				const lane = `lane-${index + 1}`;
+				return {
+					lane,
+					sessionId: `test-session-${lane}`,
+					issueId: `issue-${lane}`,
+					sink: sinkFor(lane),
+				};
+			});
+
+			for (const { lane, sessionId, issueId, sink } of sessions) {
+				manager.createCyrusAgentSession(
+					sessionId,
+					issueId,
+					{
+						id: issueId,
+						identifier: lane,
+						title: `${sessionId} activity test`,
+						description: "",
+						branchName: `${sessionId}-branch`,
+					},
+					{ path: dir, isGitWorktree: false },
+				);
+				manager.setActivitySink(sessionId, sink);
+			}
+
+			const runners = await Promise.all(
+				sessions.map(async ({ lane, sessionId }) => {
+					const runner = new OpenCodeRunner({
+						openCodePath: script,
+						workingDirectory: dir,
+						cyrusHome: dir,
+					});
+					manager.addAgentRunner(sessionId, runner);
+					await runner.start(`Handle ${lane} task`);
+					return { lane, sessionId, runner };
+				}),
+			);
+			await Promise.all(
+				runners.map(async ({ sessionId, runner }) => {
+					// Sessions still run concurrently, while each session's timeline
+					// records runner output before its compact health marker.
+					for (const message of runner.getMessages()) {
+						await manager.handleClaudeMessage(sessionId, message);
+					}
+					await manager.reportRunnerHealth(sessionId, { type: "alive" });
+					await manager.reportOpenCodeFollowUpQueued(sessionId);
+				}),
+			);
+			await Promise.all(
+				runners.map(({ sessionId, runner }) =>
+					manager.completeSession(sessionId, {
+						type: "result",
+						subtype: "success",
+						result: `completed ${sessionId}`,
+						session_id: runner.getMessages()[0].session_id,
+					} as any),
+				),
+			);
+
+			for (const { lane, sessionId, sink } of sessions) {
+				const bodies = sink.postActivity.mock.calls.map(([, activity]) =>
+					JSON.stringify(activity),
+				);
+				expect(
+					sink.postActivity.mock.calls.every(([id]) => id === sessionId),
+				).toBe(true);
+				expect(manager.getSession(sessionId)?.issueId).toBe(`issue-${lane}`);
+				expect(manager.getSession(sessionId)?.opencodeSessionId).toBe(
+					`oc_${lane.replace("lane-", "")}`,
+				);
+				expect(
+					bodies.some((body) =>
+						body.includes(`${lane.replace("lane-", "")} progress`),
+					),
+				).toBe(true);
+				expect(bodies.some((body) => body.includes("Runner alive."))).toBe(
+					true,
+				);
+				expect(
+					bodies.some((body) => body.includes("A follow-up is queued")),
+				).toBe(true);
+				expect(
+					bodies.some((body) => body.includes(`completed ${sessionId}`)),
+				).toBe(true);
+			}
+		},
+	);
+
+	it("posts bounded, safe OpenCode lifecycle visibility through public seams", async () => {
+		const runner = new OpenCodeRunner({
+			openCodePath: "/bin/true",
+			workingDirectory: makeTempDir(),
+			cyrusHome: makeTempDir(),
+		});
+		manager.addAgentRunner(sessionId, runner);
+
+		await manager.handleClaudeMessage(sessionId, {
+			type: "system",
+			subtype: "init",
+			session_id: "oc-first",
+			model: "opencode/test",
+			tools: [],
+		} as any);
+		await manager.reportOpenCodeFollowUpQueued(sessionId);
+		await manager.reportOpenCodeFollowUpQueued(sessionId);
+		await manager.completeSession(sessionId, {
+			type: "result",
+			subtype: "success",
+			duration_ms: 1,
+			duration_api_ms: 1,
+			is_error: false,
+			num_turns: 1,
+			result: "final response remains intact",
+			total_cost_usd: 0,
+			usage: {},
+			modelUsage: {},
+			permission_denials: [],
+			uuid: "result-first",
+			session_id: "oc-first",
+		} as any);
+
+		manager.addAgentRunner(sessionId, runner);
+		await manager.handleClaudeMessage(sessionId, {
+			type: "system",
+			subtype: "init",
+			session_id: "oc-resumed",
+			model: "opencode/test",
+			tools: [],
+		} as any);
+		await manager.failSession(
+			sessionId,
+			"secret prompt /private/path --token=abc",
+		);
+
+		const lifecycleBodies = postActivitySpy.mock.calls
+			.map(([, activity]) => activity)
+			.filter(
+				(activity: any) =>
+					typeof activity?.body === "string" &&
+					(activity.body.startsWith("OpenCode") ||
+						activity.body.startsWith("A follow-up is queued")),
+			)
+			.map((activity: any) => activity.body);
+
+		expect(lifecycleBodies).toEqual([
+			"OpenCode started work on this request.",
+			"A follow-up is queued and will be handled after this OpenCode turn.",
+			"OpenCode completed this turn.",
+			"OpenCode resumed work on this request.",
+			"OpenCode ended unexpectedly.",
+		]);
+		expect(lifecycleBodies.join("\n")).not.toContain("/private/path");
+		expect(lifecycleBodies.join("\n")).not.toContain("token=abc");
+		expect(
+			postActivitySpy.mock.calls.some(
+				([, activity]: any[]) =>
+					activity?.type === "response" &&
+					activity.body === "final response remains intact",
+			),
+		).toBe(true);
+	});
+
+	it("deduplicates repeated OpenCode progress milestones within a session", async () => {
+		const runner = new OpenCodeRunner({
+			openCodePath: "/bin/true",
+			workingDirectory: makeTempDir(),
+			cyrusHome: makeTempDir(),
+		});
+		manager.addAgentRunner(sessionId, runner);
+
+		const toolUse = {
+			type: "assistant",
+			message: {
+				content: [
+					{
+						type: "tool_use",
+						id: "tool-read",
+						name: "Read",
+						input: { file_path: "README.md" },
+					},
+				],
+			},
+			session_id: "oc-dedup",
+		} as any;
+
+		await manager.handleClaudeMessage(sessionId, toolUse);
+		await manager.handleClaudeMessage(sessionId, {
+			...toolUse,
+			message: {
+				content: [
+					{
+						type: "tool_use",
+						id: "tool-edit",
+						name: "Edit",
+						input: { file_path: "README.md" },
+					},
+				],
+			},
+		});
+		await manager.handleClaudeMessage(sessionId, toolUse);
+
+		expect(
+			postActivitySpy.mock.calls.filter(
+				([, activity]: any[]) =>
+					activity?.type === "thought" &&
+					activity.body === "OpenCode started a tool step.",
+			).length,
+		).toBe(2);
+	});
+
+	it("reports an intentional OpenCode stop without exposing operator input", async () => {
+		const runner = new OpenCodeRunner({
+			openCodePath: "/bin/true",
+			workingDirectory: makeTempDir(),
+			cyrusHome: makeTempDir(),
+		});
+		manager.addAgentRunner(sessionId, runner);
+
+		await manager.abortSession(sessionId);
+
+		expect(postActivitySpy).toHaveBeenCalledWith(
+			sessionId,
+			{ type: "error", body: "OpenCode was stopped by an operator." },
+			{},
+		);
+		expect(
+			postActivitySpy.mock.calls
+				.map(([, activity]) => JSON.stringify(activity))
+				.join("\n"),
+		).not.toContain("/tmp/");
+	});
+
+	it("renders a compact OpenCode failure milestone after host-interruption recovery", async () => {
+		const runner = new OpenCodeRunner({
+			openCodePath: "/bin/true",
+			workingDirectory: makeTempDir(),
+			cyrusHome: makeTempDir(),
+		});
+		manager.addAgentRunner(sessionId, runner);
+		await manager.handleClaudeMessage(sessionId, {
+			type: "system",
+			subtype: "init",
+			session_id: "oc-interrupted",
+			model: "opencode/test",
+			tools: [],
+		} as any);
+
+		const interruptedSession = manager.getSession(sessionId);
+		expect(interruptedSession).toBeDefined();
+		interruptedSession!.agentRunner = undefined;
+		await manager.reconcileInterruptedSessions();
+
+		expect(
+			postActivitySpy.mock.calls.filter(
+				([, activity]: any[]) =>
+					activity?.body === "OpenCode ended unexpectedly.",
+			),
+		).toHaveLength(1);
+		expect(postActivitySpy).toHaveBeenCalledWith(
+			sessionId,
+			{
+				type: "error",
+				body: "Session interrupted — the agent host restarted before this session finished. Send a new message to resume it.",
+			},
+			{},
+		);
+	});
 });

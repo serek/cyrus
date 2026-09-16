@@ -481,6 +481,12 @@
 					"type": "string",
 					"enum": ["inherit", "shared", "repository"]
 				},
+				"allowedDirectories": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					}
+				},
 				"config": {
 					"type": "object",
 					"propertyNames": {

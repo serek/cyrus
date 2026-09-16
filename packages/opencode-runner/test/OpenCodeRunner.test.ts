@@ -49,6 +49,238 @@ ${body}
 }
 
 describe("OpenCodeRunner", () => {
+	it("queues a live message and resumes the OpenCode session after its active turn finishes", async () => {
+		const dir = makeTempDir();
+		const captureFile = join(dir, "captures.jsonl");
+		const opencodePath = join(dir, "fake-opencode.mjs");
+		writeFileSync(
+			opencodePath,
+			`#!/usr/bin/env node
+import { appendFileSync, readFileSync } from "node:fs";
+const stdin = readFileSync(0, "utf8");
+const argv = process.argv.slice(2);
+appendFileSync(${JSON.stringify(captureFile)}, JSON.stringify({ argv, stdin }) + "\\n");
+const resumed = argv.includes("--session");
+process.stdout.write(JSON.stringify({ type: "step_start", sessionID: "oc_live_123" }) + "\\n");
+setTimeout(() => {
+  process.stdout.write(JSON.stringify({ type: "step_finish", result: resumed ? "second turn" : "first turn" }) + "\\n");
+  process.exit(0);
+}, resumed ? 0 : 1500);
+`,
+			{ mode: 0o755 },
+		);
+		const runner = new OpenCodeRunner({
+			openCodePath: opencodePath,
+			workingDirectory: dir,
+			cyrusHome: dir,
+		});
+
+		const completion = runner.startStreaming("first turn");
+		await vi.waitFor(
+			() => expect(runner.getHealthSnapshot().sessionId).toBe("oc_live_123"),
+			{ timeout: 3_000 },
+		);
+		runner.addStreamMessage("second turn");
+		expect(runner.getHealthSnapshot()).toMatchObject({
+			state: "running",
+			sessionId: "oc_live_123",
+			turn: 1,
+			lastEvent: "queue",
+			queuedFollowUpCount: 1,
+		});
+		await completion;
+
+		const invocations = readFileSync(captureFile, "utf8")
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line));
+		expect(runner.supportsStreamingInput).toBe(true);
+		expect(invocations).toEqual([
+			expect.objectContaining({ stdin: "first turn" }),
+			expect.objectContaining({
+				stdin: "second turn",
+				argv: expect.arrayContaining(["--session", "oc_live_123"]),
+			}),
+		]);
+		expect(
+			runner.getMessages().filter((message) => message.type === "result"),
+		).toHaveLength(1);
+		expect(runner.getHealthSnapshot()).toMatchObject({
+			state: "exited",
+			pid: null,
+			sessionId: "oc_live_123",
+			turn: 2,
+			lastEvent: "exit",
+			exitCode: 0,
+			queuedFollowUpCount: 0,
+		});
+	});
+
+	it("reports a live child process in its health snapshot", async () => {
+		const dir = makeTempDir();
+		const opencodePath = writeFakeOpenCode(
+			dir,
+			`
+process.stdout.write(JSON.stringify({ type: "step_start", sessionID: "oc_alive" }) + "\\n");
+setTimeout(() => process.exit(0), 1_500);
+`,
+		);
+		const runner = new OpenCodeRunner({
+			openCodePath: opencodePath,
+			workingDirectory: dir,
+			cyrusHome: dir,
+		});
+
+		const completion = runner.start("Stay alive briefly");
+		await vi.waitFor(
+			() =>
+				expect(runner.getHealthSnapshot()).toMatchObject({
+					state: "running",
+					sessionId: "oc_alive",
+					turn: 1,
+				}),
+			{ timeout: 3_000 },
+		);
+		const health = runner.getHealthSnapshot();
+		expect(health.pid).toEqual(expect.any(Number));
+		expect(health.lastEventAt).toEqual(expect.any(Number));
+
+		await completion;
+	});
+
+	it("keeps the spawn observation fresh while a child is silent", async () => {
+		const dir = makeTempDir();
+		const opencodePath = writeFakeOpenCode(
+			dir,
+			`
+setTimeout(() => process.stdout.write(JSON.stringify({ type: "step_start", sessionID: "oc_silent_health" }) + "\\n"), 80);
+setTimeout(() => process.exit(0), 100);
+`,
+		);
+		const runner = new OpenCodeRunner({
+			openCodePath: opencodePath,
+			workingDirectory: dir,
+			cyrusHome: dir,
+		});
+
+		const completion = runner.start("Wait silently");
+		await vi.waitFor(() =>
+			expect(runner.getHealthSnapshot()).toMatchObject({
+				state: "running",
+				lastEvent: "spawn",
+			}),
+		);
+		const health = runner.getHealthSnapshot();
+		expect(health.lastEventAt).toEqual(expect.any(Number));
+		expect(health.sessionId).toBeNull();
+
+		await completion;
+	});
+
+	it("refreshes health when OpenCode emits a stream event", async () => {
+		const dir = makeTempDir();
+		const opencodePath = writeFakeOpenCode(
+			dir,
+			`
+setTimeout(() => process.stdout.write(JSON.stringify({ type: "step_start", sessionID: "oc_fresh" }) + "\\n"), 500);
+setTimeout(() => process.exit(0), 1000);
+`,
+		);
+		const runner = new OpenCodeRunner({
+			openCodePath: opencodePath,
+			workingDirectory: dir,
+			cyrusHome: dir,
+		});
+
+		const completion = runner.start("Observe events");
+		await vi.waitFor(() =>
+			expect(runner.getHealthSnapshot().lastEvent).toBe("spawn"),
+		);
+		const spawnedAt = runner.getHealthSnapshot().lastEventAt;
+		await new Promise<void>((resolve) => runner.once("streamEvent", resolve));
+		expect(runner.getHealthSnapshot()).toMatchObject({
+			lastEvent: "stream_event",
+			sessionId: "oc_fresh",
+		});
+		expect(runner.getHealthSnapshot().lastEventAt).toBeGreaterThan(
+			spawnedAt as number,
+		);
+
+		await completion;
+	});
+
+	it("records child exit status in its health snapshot", async () => {
+		const dir = makeTempDir();
+		const opencodePath = writeFakeOpenCode(dir, "process.exit(17);");
+		const runner = new OpenCodeRunner({
+			openCodePath: opencodePath,
+			workingDirectory: dir,
+			cyrusHome: dir,
+		});
+
+		await runner.start("Fail");
+
+		expect(runner.getHealthSnapshot()).toMatchObject({
+			state: "exited",
+			pid: null,
+			turn: 1,
+			lastEvent: "exit",
+			exitCode: 17,
+			exitSignal: null,
+		});
+	});
+
+	it("keeps health and follow-up queues isolated across concurrent runners", async () => {
+		const firstDir = makeTempDir();
+		const secondDir = makeTempDir();
+		const firstPath = writeFakeOpenCode(
+			firstDir,
+			`
+process.stdout.write(JSON.stringify({ type: "step_start", sessionID: "oc_first" }) + "\\n");
+setTimeout(() => process.exit(0), 1500);
+`,
+		);
+		const secondPath = writeFakeOpenCode(
+			secondDir,
+			`
+process.stdout.write(JSON.stringify({ type: "step_start", sessionID: "oc_second" }) + "\\n");
+setTimeout(() => process.exit(0), 1500);
+`,
+		);
+		const first = new OpenCodeRunner({
+			openCodePath: firstPath,
+			workingDirectory: firstDir,
+			cyrusHome: firstDir,
+		});
+		const second = new OpenCodeRunner({
+			openCodePath: secondPath,
+			workingDirectory: secondDir,
+			cyrusHome: secondDir,
+		});
+
+		const completions = [first.start("first"), second.start("second")];
+		await vi.waitFor(() => {
+			expect(first.getHealthSnapshot().sessionId).toBe("oc_first");
+			expect(second.getHealthSnapshot().state).toBe("running");
+		});
+		first.addStreamMessage("first follow-up");
+		expect(first.getHealthSnapshot().queuedFollowUpCount).toBe(1);
+		expect(second.getHealthSnapshot().queuedFollowUpCount).toBe(0);
+
+		await Promise.all(completions);
+
+		expect(first.getHealthSnapshot()).toMatchObject({
+			sessionId: "oc_first",
+			turn: 2,
+			queuedFollowUpCount: 0,
+		});
+		expect(second.getHealthSnapshot()).toMatchObject({
+			sessionId: "oc_second",
+			turn: 1,
+			queuedFollowUpCount: 0,
+		});
+	});
+
 	it("spawns opencode run with JSON output flags and maps replay events to Cyrus messages", async () => {
 		const dir = makeTempDir();
 		const captureFile = join(dir, "capture.json");
@@ -74,7 +306,7 @@ describe("OpenCodeRunner", () => {
 
 		expect(session.sessionId).toBe("oc_session_123");
 		expect(session.isRunning).toBe(false);
-		expect(runner.supportsStreamingInput).toBe(false);
+		expect(runner.supportsStreamingInput).toBe(true);
 		expect(runner.isRunning()).toBe(false);
 		expect(messages).toEqual(runner.getMessages());
 

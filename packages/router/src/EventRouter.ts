@@ -6,6 +6,7 @@ import {
 	isAgentSessionCreatedWebhook,
 	isAgentSessionPromptedWebhook,
 	isIssueDeletedWebhook,
+	isIssueNewCommentWebhook,
 	isIssueStateChangeWebhook,
 	type LogEventAttributes,
 	type RunAttribution,
@@ -400,6 +401,10 @@ export class EventRouter {
 			await this.routeCreated(webhook);
 			return;
 		}
+		if (isIssueNewCommentWebhook(webhook)) {
+			await this.routeIssueOwnerComment(webhook);
+			return;
+		}
 		// Terminal-state webhooks carry no agent session, so they route on issue
 		// affinity rather than through resolveTarget(). The device needs them to
 		// run its own terminal-state cleanup (stop sessions, cyrus-teardown.sh,
@@ -420,6 +425,42 @@ export class EventRouter {
 		}
 		this.logger.info(
 			`EventRouter ignoring non-agent-session webhook ${webhook.type}/${webhook.action}`,
+		);
+	}
+
+	/**
+	 * Forward a regular issue comment to the device already owning that issue.
+	 *
+	 * The notification has no agent-session id, so the router cannot safely
+	 * choose a session itself. EdgeWorker performs that final, creator-only and
+	 * ambiguity-checked selection after delivery. An issue-affinity lookup keeps
+	 * this constrained to the existing owner rather than treating every comment
+	 * as a new routing request.
+	 */
+	private async routeIssueOwnerComment(webhook: Webhook): Promise<void> {
+		const issue = (
+			webhook as {
+				notification?: { issue?: { id?: string; identifier?: string } };
+			}
+		).notification?.issue;
+		const issueId = issue?.id;
+		if (!issueId) return;
+
+		const deviceId = this.store.getIssueAffinity(issueId);
+		if (deviceId === undefined) return;
+
+		this.store.enqueueEvent(
+			deviceId,
+			JSON.stringify(webhook),
+			this.now(),
+			this.config.eventTtlMs,
+			injectTraceContext(),
+		);
+		if (this.gateway.isOnline(deviceId)) {
+			this.gateway.deliverPending(deviceId);
+		}
+		this.logger.info(
+			`Forwarded ordinary comment for issue ${issue?.identifier ?? issueId} to device ${deviceId}`,
 		);
 	}
 

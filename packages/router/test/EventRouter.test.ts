@@ -241,6 +241,33 @@ function issueStatusChangedEvent(opts: {
 	} as unknown as AgentEvent;
 }
 
+/** A regular Linear comment, which has no agent-session envelope of its own. */
+function issueNewCommentEvent(opts: {
+	issueId: string;
+	identifier?: string;
+	organizationId?: string;
+	createdAtMs?: number;
+}): AgentEvent {
+	return {
+		type: "AppUserNotification",
+		action: "issueNewComment",
+		organizationId: opts.organizationId ?? "ws-1",
+		createdAt: new Date(opts.createdAtMs ?? ROUTE_NOW).toISOString(),
+		notification: {
+			issue: {
+				id: opts.issueId,
+				identifier: opts.identifier ?? "TEST-1",
+			},
+			comment: {
+				id: "comment-1",
+				body: "Please continue",
+				userId: "lin-alice",
+			},
+			actorId: "lin-alice",
+		},
+	} as unknown as AgentEvent;
+}
+
 /** Minimal object that satisfies isIssueDeletedWebhook (a deleted issue is terminal too). */
 function issueDeletedEvent(opts: {
 	issueId: string;
@@ -371,6 +398,26 @@ describe("EventRouter", () => {
 			"sess-1",
 			offlineWaitingMessage("alice@example.com"),
 		]);
+	});
+
+	it("forwards an ordinary issue comment to the issue's active device", async () => {
+		const deviceId = enroll(store, "alice@example.com", {
+			linearId: "lin-alice",
+		});
+		const { router } = makeRouter(store);
+		store.setIssueAffinity("ISS-1", deviceId);
+
+		const comment = issueNewCommentEvent({ issueId: "ISS-1" });
+		await router.route(comment);
+		await router.route(comment);
+
+		const [queued] = store.pendingEvents(deviceId, 0, ROUTE_NOW);
+		expect(queued).toBeDefined();
+		expect(store.pendingEvents(deviceId, 0, ROUTE_NOW)).toHaveLength(1);
+		expect(JSON.parse(queued!.payloadJson)).toMatchObject({
+			type: "AppUserNotification",
+			action: "issueNewComment",
+		});
 	});
 
 	it("records routed input ids and the exact terminal run outcome", async () => {
